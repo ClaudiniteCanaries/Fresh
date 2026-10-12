@@ -68,7 +68,7 @@ jobs:
       # newer release went out first.
       - name: the adoption pinned this version
         run: |
-          pinned=$(sh .claudinite/launch version | head -n 1)
+          pinned=$({ if [ -f .claudinite/setup-cn.sh ]; then sh .claudinite/setup-cn.sh >&2 && .claudinite/bin/cn version; else sh .claudinite/launch version; fi; } | head -n 1)
           if [ "$pinned" != "$VERSION" ]; then
             echo "::error::the adoption pinned $pinned, not $VERSION"
             exit 1
