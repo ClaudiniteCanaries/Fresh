@@ -68,7 +68,7 @@ jobs:
       # newer release went out first.
       - name: the adoption pinned this version
         run: |
-          pinned=$({ npx --yes @claudinite/setup@1.0.1 >&2 && .claudinite/bin/cn version; } | head -n 1)
+          pinned=$({ npx --yes @claudinite/setup@1.0.1 >&2 && .claudinite/bin/cn version; } | sed -n 1p)
           if [ "$pinned" != "$VERSION" ]; then
             echo "::error::the adoption pinned $pinned, not $VERSION"
             exit 1
