@@ -168,14 +168,14 @@ jobs:
           : > "$RUNNER_TEMP/pins"
           for sha in $(git log --reverse --format=%H -G'^  version: ' origin/HEAD -- .claudinite/settings.yaml); do
             v=$(git show "$sha:.claudinite/settings.yaml" | pin)
-            [ -n "$v" ] && ! grep -q " $v\$" "$RUNNER_TEMP/pins" && echo "$sha $v" >> "$RUNNER_TEMP/pins"
+            if [ -n "$v" ] && ! grep -q " $v\$" "$RUNNER_TEMP/pins"; then echo "$sha $v" >> "$RUNNER_TEMP/pins"; fi
           done
           latest=$(npm view @claudinite/cli dist-tags.latest)
-          stable=$(while read -r sha v; do { [ "$v" = "$latest" ] || older "$v" "$latest"; } && echo "$v"; done < "$RUNNER_TEMP/pins" | tail -n 3)
+          stable=$(while read -r sha v; do if [ "$v" = "$latest" ] || older "$v" "$latest"; then echo "$v"; fi; done < "$RUNNER_TEMP/pins" | tail -n 3)
           oldest=""
           for repo in $(gh api "orgs/ClaudiniteCanaries/repos?type=public&per_page=100" --jq '.[] | select(.archived | not) | .full_name'); do
             v=$(curl -fsSL "https://raw.githubusercontent.com/$repo/HEAD/.claudinite/settings.yaml" 2>/dev/null | pin || true)
-            [ -n "$v" ] && { [ -z "$oldest" ] || older "$v" "$oldest"; } && oldest=$v
+            if [ -n "$v" ] && { [ -z "$oldest" ] || older "$v" "$oldest"; }; then oldest=$v; fi
           done
           echo "latest $latest; stable pins: $(echo $stable); oldest held: ${oldest:-none}"
           rows=""
