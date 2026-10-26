@@ -1,11 +1,16 @@
-# The empty canary. A Claudinite engine release dispatches it with the
-# version it just published. It waits until npm serves that version, then
-# adopts this empty repo with it from npm on a throwaway branch, the real
-# bootstrap a new member runs, and passes when cn verify, cn selftest --repo
-# and cn check world are all clean. It pushes nothing. When it fails, the
-# report job opens a release-blocker issue naming the version in this repo,
-# or comments on the one already open, which holds the release back from
-# promotion to stable.
+# The empty canary: people adopting at different times. A Claudinite engine
+# release dispatches it with the version it just published. It waits until
+# npm serves that version, then adopts this empty repo with it from npm on a
+# throwaway branch, the real bootstrap a new member runs, and passes when the
+# installer's update right after finds nothing newer and cn verify, cn
+# selftest --repo and cn check world are all clean. A second adoption starts
+# from a ci.yml that runs on push only. The upgrade matrix takes Lagging's
+# main as it stood at each of the last three stable versions it pinned and
+# at the oldest version any canary holds, and passes when the installer's
+# update moves each to this version with selftest clean and no new finding.
+# It pushes nothing. When it fails, the report job opens a release-blocker
+# issue naming the version in this repo, or comments on the one already
+# open, which holds the release back from promotion to stable.
 name: canary
 
 on:
@@ -73,6 +78,28 @@ jobs:
             echo "::error::the adoption pinned $pinned, not $VERSION"
             exit 1
           fi
+      # Every new member gets a pull_request workflow that runs the checks.
+      - name: the adoption added a pull_request check workflow
+        if: ${{ !cancelled() && steps.adopt.outcome == 'success' }}
+        run: |
+          found=$(grep -l 'pull_request' .github/workflows/*.yml 2>/dev/null || true)
+          if [ -z "$found" ]; then
+            echo "::error::the adoption wrote no workflow that runs on pull_request"
+            exit 1
+          fi
+          echo "$found"
+      - name: the installer's update right after finds nothing newer
+        if: ${{ !cancelled() && steps.adopt.outcome == 'success' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          npx --yes @claudinite/setup@1 update --repo . --dry-run --json > "$RUNNER_TEMP/update.json"
+          cat "$RUNNER_TEMP/update.json"
+          read -r from to files < <(jq -r '[.from, .to, (.files | length)] | @tsv' "$RUNNER_TEMP/update.json")
+          if [ "$from" != "$VERSION" ] || [ "$to" != "$VERSION" ] || [ "$files" != 0 ]; then
+            echo "::error::right after adopting $VERSION the update moves $from to $to and writes $files file(s)"
+            exit 1
+          fi
       - name: cn verify
         if: ${{ !cancelled() && steps.adopt.outcome == 'success' }}
         run: .claudinite/bin/cn verify
@@ -83,8 +110,146 @@ jobs:
         if: ${{ !cancelled() && steps.adopt.outcome == 'success' }}
         run: .claudinite/bin/cn check world
 
-  report:
+  push-only-ci:
     needs: canary
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: a repo whose ci.yml runs on push only
+        run: |
+          git switch -c "canary/$VERSION-push-only"
+          mkdir -p .github/workflows
+          printf '%s\n' 'name: ci' 'on: push' 'jobs:' '  build:' '    runs-on: ubuntu-24.04' '    steps:' '      - run: echo build' > .github/workflows/ci.yml
+          git add .github/workflows/ci.yml
+      - name: adopt from npm
+        run: npx --yes "@claudinite/cli@$VERSION" adopt basics --channel staging
+      - name: the adoption added claudinite-check.yml
+        run: |
+          if [ ! -f .github/workflows/claudinite-check.yml ]; then
+            echo "::error::adopting a repo whose ci.yml runs on push only wrote no claudinite-check.yml"
+            ls .github/workflows
+            exit 1
+          fi
+          grep -q pull_request .github/workflows/claudinite-check.yml || {
+            echo "::error::claudinite-check.yml does not run on pull_request"
+            exit 1
+          }
+      - name: cn check world
+        run: .claudinite/bin/cn check world
+
+  # The versions people hold: the last three stable versions Lagging's main
+  # pinned, and the oldest version any public canary pins today, each with
+  # the Lagging commit that first pinned it.
+  versions:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+    env:
+      VERSION: ${{ inputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: pick the versions
+        id: pick
+        run: |
+          git clone -q --filter=blob:none https://github.com/ClaudiniteCanaries/Lagging "$RUNNER_TEMP/lagging"
+          cd "$RUNNER_TEMP/lagging"
+          pin() { sed -n 's/^  version: "\(.*\)"$/\1/p' | head -n 1; }
+          older() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -t. -k1,1n -k2,2n -k3,3n | head -n 1)" = "$1" ]; }
+          : > "$RUNNER_TEMP/pins"
+          for sha in $(git log --reverse --format=%H -G'^  version: ' origin/HEAD -- .claudinite/settings.yaml); do
+            v=$(git show "$sha:.claudinite/settings.yaml" | pin)
+            [ -n "$v" ] && ! grep -q " $v\$" "$RUNNER_TEMP/pins" && echo "$sha $v" >> "$RUNNER_TEMP/pins"
+          done
+          latest=$(npm view @claudinite/cli dist-tags.latest)
+          stable=$(while read -r sha v; do { [ "$v" = "$latest" ] || older "$v" "$latest"; } && echo "$v"; done < "$RUNNER_TEMP/pins" | tail -n 3)
+          oldest=""
+          for repo in $(gh api "orgs/ClaudiniteCanaries/repos?type=public&per_page=100" --jq '.[] | select(.archived | not) | .full_name'); do
+            v=$(curl -fsSL "https://raw.githubusercontent.com/$repo/HEAD/.claudinite/settings.yaml" 2>/dev/null | pin || true)
+            [ -n "$v" ] && { [ -z "$oldest" ] || older "$v" "$oldest"; } && oldest=$v
+          done
+          echo "latest $latest; stable pins: $(echo $stable); oldest held: ${oldest:-none}"
+          rows=""
+          for v in $(printf '%s\n' $stable $oldest | sort -u); do
+            older "$v" "$VERSION" || continue
+            sha=$(awk -v v="$v" '$2 == v { print $1; exit }' "$RUNNER_TEMP/pins")
+            if [ -z "$sha" ]; then
+              echo "::notice::Lagging never pinned $v, so the matrix starts nowhere for it"
+              continue
+            fi
+            rows="$rows{\"from\":\"$v\",\"sha\":\"$sha\"},"
+          done
+          if [ -z "$rows" ]; then
+            echo "::error::no version older than $VERSION to upgrade from"
+            exit 1
+          fi
+          echo "matrix={\"include\":[${rows%,}]}" | tee -a "$GITHUB_OUTPUT"
+
+  upgrade:
+    needs: [canary, versions]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.versions.outputs.matrix) }}
+    name: upgrade from ${{ matrix.from }}
+    env:
+      VERSION: ${{ inputs.version }}
+      FROM: ${{ matrix.from }}
+    steps:
+      - name: Lagging's main as it stood at the version
+        run: |
+          git clone -q https://github.com/ClaudiniteCanaries/Lagging "$RUNNER_TEMP/member"
+          git -C "$RUNNER_TEMP/member" checkout -q --detach "${{ matrix.sha }}"
+      - name: findings before the update
+        working-directory: ${{ runner.temp }}/member
+        run: |
+          npx --yes @claudinite/setup@1
+          [ "$(.claudinite/bin/cn version | sed -n 1p)" = "$FROM" ] || { echo "::error::the snapshot does not run $FROM"; exit 1; }
+          .claudinite/bin/cn check world > "$RUNNER_TEMP/before.txt" || true
+          cat "$RUNNER_TEMP/before.txt"
+      - name: the installer's update to the version
+        working-directory: ${{ runner.temp }}/member
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          npx --yes @claudinite/setup@1 update --repo . --to "$VERSION" --json > "$RUNNER_TEMP/update.json"
+          jq 'del(.log)' "$RUNNER_TEMP/update.json"
+          pinned=$(sed -n 's/^  version: "\(.*\)"$/\1/p' .claudinite/settings.yaml | head -n 1)
+          if [ "$pinned" != "$VERSION" ]; then
+            echo "::error::the update from $FROM pins $pinned, not $VERSION"
+            exit 1
+          fi
+      - name: cn selftest --repo
+        working-directory: ${{ runner.temp }}/member
+        run: .claudinite/bin/cn selftest --repo .
+      - name: no new finding in cn check world
+        working-directory: ${{ runner.temp }}/member
+        run: |
+          .claudinite/bin/cn check world > "$RUNNER_TEMP/after.txt" || true
+          cat "$RUNNER_TEMP/after.txt"
+          # A run with no finding is a clean one, so grep matching nothing is no error.
+          keys() { grep -E '^(break|finding|advisory) ' "$1" | sed 's/: .*//' | sort -u || true; }
+          new=$(comm -13 <(keys "$RUNNER_TEMP/before.txt") <(keys "$RUNNER_TEMP/after.txt"))
+          if [ -n "$new" ]; then
+            echo "::error::cn check world on $VERSION reports findings it did not report on $FROM:"
+            echo "$new"
+            exit 1
+          fi
+
+  report:
+    needs: [canary, push-only-ci, versions, upgrade]
     if: failure()
     runs-on: ubuntu-24.04
     permissions:
