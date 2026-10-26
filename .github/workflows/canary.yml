@@ -142,7 +142,9 @@ jobs:
             exit 1
           }
       - name: cn check world
-        run: .claudinite/bin/cn check world
+        run: |
+          npx --yes @claudinite/setup@1.0.1 >&2
+          .claudinite/bin/cn check world
 
   # The versions people hold: the last three stable versions Lagging's main
   # pinned, and the oldest version any public canary pins today, each with
