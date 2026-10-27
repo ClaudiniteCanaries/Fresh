@@ -8,8 +8,11 @@
 # main as it stood at each of the last three stable versions it pinned and
 # at the oldest version any canary holds, and passes when the installer's
 # update moves each to this version with selftest clean and no new finding.
-# It pushes nothing. When it fails, the report job opens a release-blocker
-# issue naming the version in this repo, or comments on the one already
+# The encrypted and handover jobs play the session history scenarios: a
+# single repo with its own key secret, and one without. The first pushes and
+# deletes a branch; the second files and closes one issue.
+# Apart from those two it pushes nothing. When it fails, the report job opens
+# a release-blocker issue naming the version in this repo, or comments on the one already
 # open, which holds the release back from promotion to stable.
 name: canary
 
@@ -146,6 +149,243 @@ jobs:
           npx --yes @claudinite/setup@1.0.1 >&2
           .claudinite/bin/cn check world
 
+  # S-05. A single repo with its own key secret. The secret lives in the
+  # claudinite environment, which only main may read, so this job runs from
+  # main. The public key file is derived here by a script that shares no code
+  # with the engine; a fixture session captured with it must land on
+  # encrypted-agent-sessions as ciphertext only and open with the secret.
+  encrypted:
+    needs: canary
+    if: ${{ !cancelled() && needs.canary.result != 'skipped' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment:
+      name: claudinite
+      deployment: false
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ inputs.version }}
+      BRANCH: encrypted-agent-sessions
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: true
+      - name: adopt from npm on a throwaway branch
+        run: |
+          git switch -c "canary/$VERSION-encrypted"
+          npx --yes "@claudinite/cli@$VERSION" adopt basics --channel staging > /dev/null
+          npx --yes @claudinite/setup@1.0.1 > /dev/null
+          .claudinite/bin/cn version | sed -n 1p
+          sudo apt-get install -y --no-install-recommends age > /dev/null
+      - name: S-05 start with no session branch
+        run: |
+          for b in "$BRANCH" agent-sessions conversation-logs; do
+            if git ls-remote --exit-code --heads origin "$b" > /dev/null; then
+              echo "::notice::deleting $b, left by an earlier run"
+              git push origin --delete "$b"
+            fi
+          done
+      - name: S-05 the secret derives the public key file
+        env:
+          SESSION_HISTORY_KEY: ${{ secrets.SESSION_HISTORY_KEY }}
+          REPO_ID: ${{ github.repository_id }}
+        run: |
+          if [ -z "$SESSION_HISTORY_KEY" ]; then
+            echo "::error::SESSION_HISTORY_KEY is empty in the claudinite environment: add it (Claudinite/Engine#500, M-03)"
+            exit 1
+          fi
+          mkdir -p .claudinite/keys
+          python3 scripts/derive_history_key.py "$REPO_ID" .claudinite/keys/conversation-logs.pub "$RUNNER_TEMP/identity.txt"
+          echo "::add-mask::$(tail -n 1 "$RUNNER_TEMP/identity.txt")"
+          cat .claudinite/keys/conversation-logs.pub
+          # check world exits 0 on an advisory, so the finding is what is asserted.
+          .claudinite/bin/cn check world > "$RUNNER_TEMP/world.txt" || true
+          cat "$RUNNER_TEMP/world.txt"
+          if grep -q 'history-key-missing' "$RUNNER_TEMP/world.txt"; then
+            echo "::error::cn check world still reports history-key-missing with the public key file committed"
+            exit 1
+          fi
+      - name: S-05 a fixture session lands as ciphertext only
+        run: |
+          .claudinite/bin/cn growth capture --issue 0 --session "canary-fresh-$VERSION" \
+            --transcript canary-fixtures/session.jsonl | tee "$RUNNER_TEMP/capture.txt"
+          grep -q "on $BRANCH" "$RUNNER_TEMP/capture.txt" || {
+            echo "::error::the capture did not report a file stored on $BRANCH"
+            exit 1
+          }
+          git ls-remote --exit-code --heads origin "$BRANCH" > /dev/null || {
+            echo "::error::$BRANCH does not exist on origin after the capture"
+            exit 1
+          }
+          for b in agent-sessions conversation-logs; do
+            if git ls-remote --exit-code --heads origin "$b" > /dev/null; then
+              echo "::error::the capture created a $b branch"
+              exit 1
+            fi
+          done
+          git fetch --quiet origin "$BRANCH"
+          files=$(git ls-tree -r --name-only FETCH_HEAD | grep -v '^README.md$')
+          if [ -z "$files" ] || printf '%s\n' "$files" | grep -qv '\.age$'; then
+            echo "::error::$BRANCH holds something that is not an .age file, or nothing: $files"
+            exit 1
+          fi
+          # grep exits 1 on no match, which is the wanted answer here.
+          if git grep -q 'canary-fixture-marker' FETCH_HEAD; then
+            echo "::error::the fixture's text is readable on $BRANCH"
+            exit 1
+          fi
+          who=$(git log -1 --format=%an FETCH_HEAD)
+          if [ "$who" != claudinite-capture ]; then
+            echo "::error::the capture was committed as $who, not claudinite-capture"
+            exit 1
+          fi
+      - name: S-05 the secret opens the capture and it matches the fixture
+        run: |
+          f=$(git ls-tree -r --name-only FETCH_HEAD | grep '\.age$' | head -n 1)
+          git show "FETCH_HEAD:$f" | age -d -i "$RUNNER_TEMP/identity.txt" | gunzip > "$RUNNER_TEMP/opened.jsonl"
+          # The first line is the capture's own header; the rest is the transcript.
+          tail -n +2 "$RUNNER_TEMP/opened.jsonl" | diff - canary-fixtures/session.jsonl || {
+            echo "::error::the opened capture differs from the fixture"
+            exit 1
+          }
+          echo "the capture opens with the secret and matches the fixture"
+      - name: S-05 delete the branch
+        if: ${{ always() }}
+        run: |
+          if git ls-remote --exit-code --heads origin "$BRANCH" > /dev/null; then
+            git push origin --delete "$BRANCH"
+          fi
+
+  # S-06. A single repo that never added the secret. Nothing here reads the
+  # claudinite environment, and the job may write issues in this repo only
+  # for the scheduler and executor run of this scenario. The adopted tasks are
+  # all disabled but engine/history-key so the executor has nothing else to do.
+  handover:
+    needs: canary
+    if: ${{ !cancelled() && needs.canary.result != 'skipped' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      issues: write
+    env:
+      VERSION: ${{ inputs.version }}
+      GH_TOKEN: ${{ github.token }}
+      GITHUB_TOKEN: ${{ github.token }}
+      TITLE: "[claudinite-work] engine/history-key"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+      - name: adopt from npm on a throwaway branch with one task
+        run: |
+          git switch -c "canary/$VERSION-handover"
+          npx --yes "@claudinite/cli@$VERSION" adopt basics --channel staging > /dev/null
+          npx --yes @claudinite/setup@1.0.1 > /dev/null
+          {
+            echo "  disabled:"
+            .claudinite/bin/cn check list --tasks | awk '$1 != "engine/history-key" { print "    - " $1 }'
+          } > "$RUNNER_TEMP/disabled.yaml"
+          awk -v f="$RUNNER_TEMP/disabled.yaml" '{ print } /^tasks:$/ { while ((getline l < f) > 0) print l }' \
+            .claudinite/settings.yaml > "$RUNNER_TEMP/settings.yaml"
+          mv "$RUNNER_TEMP/settings.yaml" .claudinite/settings.yaml
+          .claudinite/bin/cn version | sed -n 1p
+      - name: S-06 start with no open history-key item
+        run: |
+          for n in $(gh api "repos/$GITHUB_REPOSITORY/issues?state=open&per_page=100" \
+            --jq ".[] | select(.pull_request == null and .title == \"$TITLE\") | .number"); do
+            gh issue close "$n" --repo "$GITHUB_REPOSITORY" --reason "not planned" \
+              --comment "Closed by the canary: an item left by an earlier run."
+          done
+      - name: S-06 the scheduler files one history-key item
+        env:
+          CLAUDINITE_WAKE: engine/history-key
+        run: |
+          started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          echo "$started" > "$RUNNER_TEMP/started"
+          .claudinite/bin/cn schedule run
+          for _ in $(seq 6); do
+            n=$(gh api "repos/$GITHUB_REPOSITORY/issues?state=all&since=$started&per_page=100" \
+              --jq "[.[] | select(.pull_request == null and .title == \"$TITLE\")] | length")
+            [ "$n" = 1 ] && break
+            sleep 10
+          done
+          if [ "$n" != 1 ]; then
+            echo "::error::the scheduler run filed $n history-key items, not one"
+            exit 1
+          fi
+      - name: S-06 the executor parks it as the handover
+        run: |
+          .claudinite/bin/cn execute loop
+          started=$(cat "$RUNNER_TEMP/started")
+          deadline=$((SECONDS + 5 * 60))
+          while :; do
+            item=$(gh api "repos/$GITHUB_REPOSITORY/issues?state=all&since=$started&per_page=100" \
+              --jq "[.[] | select(.pull_request == null and .title == \"$TITLE\")] | first")
+            labels=$(jq -r '[.labels[].name] | join(" ")' <<<"$item")
+            case " $labels " in
+              *" task:status:needs-human-action "*) break ;;
+            esac
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::the deadline passed before the item was parked as needing a person; it carries: $labels"
+              exit 1
+            fi
+            sleep 10
+          done
+          number=$(jq -r .number <<<"$item")
+          echo "$number" > "$RUNNER_TEMP/item"
+          text="$(jq -r .body <<<"$item")
+          $(gh api "repos/$GITHUB_REPOSITORY/issues/$number/comments" --jq '.[].body')"
+          case $text in
+            *"/settings/environments"*) ;;
+            *)
+              echo "::error::the parked item names no link to the repository's environments"
+              printf '%s\n' "$text"
+              exit 1 ;;
+          esac
+      - name: S-06 a second scheduler run files nothing new
+        run: |
+          .claudinite/bin/cn schedule run
+          started=$(cat "$RUNNER_TEMP/started")
+          sleep 10
+          n=$(gh api "repos/$GITHUB_REPOSITORY/issues?state=all&since=$started&per_page=100" \
+            --jq "[.[] | select(.pull_request == null and .title == \"$TITLE\")] | length")
+          if [ "$n" != 1 ]; then
+            echo "::error::a second scheduler run left $n history-key items, not the one parked"
+            exit 1
+          fi
+      - name: S-06 capture stores nothing and cn check world reports the missing secret
+        run: |
+          .claudinite/bin/cn growth capture --issue 0 --session "canary-handover-$VERSION" \
+            --transcript canary-fixtures/session.jsonl | tee "$RUNNER_TEMP/capture.txt"
+          grep -q 'no public key' "$RUNNER_TEMP/capture.txt" || {
+            echo "::error::the capture did not say it stored nothing for want of a public key"
+            exit 1
+          }
+          for b in encrypted-agent-sessions agent-sessions conversation-logs; do
+            if git ls-remote --exit-code --heads "https://github.com/$GITHUB_REPOSITORY" "$b" > /dev/null; then
+              echo "::error::the capture left a $b branch"
+              exit 1
+            fi
+          done
+          .claudinite/bin/cn check world > "$RUNNER_TEMP/world.txt" || true
+          cat "$RUNNER_TEMP/world.txt"
+          grep -q 'history-key-missing' "$RUNNER_TEMP/world.txt" || {
+            echo "::error::cn check world did not report history-key-missing"
+            exit 1
+          }
+      - name: S-06 close the parked item
+        if: ${{ always() }}
+        run: |
+          for n in $(gh api "repos/$GITHUB_REPOSITORY/issues?state=open&per_page=100" \
+            --jq ".[] | select(.pull_request == null and .title == \"$TITLE\") | .number"); do
+            gh issue close "$n" --repo "$GITHUB_REPOSITORY" --reason "not planned" \
+              --comment "Closed by the canary for $VERSION: the scenario is over."
+          done
+
   # The versions people hold: the last three stable versions Lagging's main
   # pinned, and the oldest version any public canary pins today, each with
   # the Lagging commit that first pinned it.
@@ -251,7 +491,7 @@ jobs:
           fi
 
   report:
-    needs: [canary, push-only-ci, versions, upgrade]
+    needs: [canary, push-only-ci, encrypted, handover, versions, upgrade]
     if: failure()
     runs-on: ubuntu-24.04
     permissions:
