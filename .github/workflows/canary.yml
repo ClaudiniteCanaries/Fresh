@@ -300,6 +300,17 @@ jobs:
             gh issue close "$n" --repo "$GITHUB_REPOSITORY" --reason "not planned" \
               --comment "Closed by the canary: an item left by an earlier run."
           done
+
+          # A closed item still wearing its park label is the task's newest
+          # run and makes its next item decline; a person's handover ends in done.
+          for n in $(gh api "repos/$GITHUB_REPOSITORY/issues?state=all&per_page=100" \
+            --jq ".[] | select(.pull_request == null and .title == \"$TITLE\" and (.labels | map(.name) | any(startswith(\"task:status:needs-human-\")))) | .number"); do
+            for l in $(gh api "repos/$GITHUB_REPOSITORY/issues/$n" --jq '.labels[].name | select(startswith("task:status:needs-human-"))'); do
+              gh issue edit "$n" --repo "$GITHUB_REPOSITORY" --remove-label "$l" > /dev/null
+            done
+            gh issue edit "$n" --repo "$GITHUB_REPOSITORY" --add-label task:status:done > /dev/null
+            gh issue close "$n" --repo "$GITHUB_REPOSITORY" --reason completed > /dev/null || true
+          done
       - name: S-06 the scheduler files one history-key item
         env:
           CLAUDINITE_WAKE: engine/history-key
@@ -384,6 +395,17 @@ jobs:
             --jq ".[] | select(.pull_request == null and .title == \"$TITLE\") | .number"); do
             gh issue close "$n" --repo "$GITHUB_REPOSITORY" --reason "not planned" \
               --comment "Closed by the canary for $VERSION: the scenario is over."
+          done
+
+          # A closed item still wearing its park label is the task's newest
+          # run and makes its next item decline; a person's handover ends in done.
+          for n in $(gh api "repos/$GITHUB_REPOSITORY/issues?state=all&per_page=100" \
+            --jq ".[] | select(.pull_request == null and .title == \"$TITLE\" and (.labels | map(.name) | any(startswith(\"task:status:needs-human-\")))) | .number"); do
+            for l in $(gh api "repos/$GITHUB_REPOSITORY/issues/$n" --jq '.labels[].name | select(startswith("task:status:needs-human-"))'); do
+              gh issue edit "$n" --repo "$GITHUB_REPOSITORY" --remove-label "$l" > /dev/null
+            done
+            gh issue edit "$n" --repo "$GITHUB_REPOSITORY" --add-label task:status:done > /dev/null
+            gh issue close "$n" --repo "$GITHUB_REPOSITORY" --reason completed > /dev/null || true
           done
 
   # The versions people hold: the last three stable versions Lagging's main
