@@ -465,7 +465,30 @@ jobs:
         working-directory: ${{ runner.temp }}/member
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          CLAUDINITE_MANAGER_TOKEN: ${{ secrets.CLAUDINITE_MANAGER_TOKEN }}
         run: |
+          # The snapshot names a private manager. Without a token for it the
+          # update cannot read the directory, so the snapshot is taken as a
+          # member with no manager, which leaves the engine's own update intact.
+          if [ -z "$CLAUDINITE_MANAGER_TOKEN" ]; then
+            echo "::notice::no CLAUDINITE_MANAGER_TOKEN in this repository: the snapshot's manager is dropped"
+            python3 - <<'PY'
+          import re
+          p = ".claudinite/settings.yaml"
+          lines = open(p).read().split("\n")
+          out, skip = [], None
+          for l in lines:
+              if skip is not None:
+                  if l.strip() == "" or len(l) - len(l.lstrip()) > skip:
+                      continue
+                  skip = None
+              if re.match(r"^\s+manager:\s*$", l):
+                  skip = len(l) - len(l.lstrip())
+                  continue
+              out.append(l)
+          open(p, "w").write("\n".join(out))
+          PY
+          fi
           npx --yes @claudinite/setup@1 update --repo . --to "$VERSION" --json > "$RUNNER_TEMP/update.json"
           jq 'del(.log)' "$RUNNER_TEMP/update.json"
           pinned=$(sed -n 's/^  version: "\(.*\)"$/\1/p' .claudinite/settings.yaml | head -n 1)
