@@ -527,7 +527,8 @@ jobs:
           .claudinite/bin/cn check world > "$RUNNER_TEMP/after.txt" || true
           cat "$RUNNER_TEMP/after.txt"
           # A run with no finding is a clean one, so grep matching nothing is no error.
-          keys() { grep -E '^(break|finding|advisory) ' "$1" | sed 's/: .*//' | sort -u || true; }
+          # Only the classes that block an update count: an advisory or a deprecation blocks nothing.
+          keys() { grep -E '^(break|finding) ' "$1" | sed 's/: .*//' | sort -u || true; }
           new=$(comm -13 <(keys "$RUNNER_TEMP/before.txt") <(keys "$RUNNER_TEMP/after.txt"))
           if [ -n "$new" ]; then
             echo "::error::cn check world on $VERSION reports findings it did not report on $FROM:"
